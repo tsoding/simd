@@ -1,15 +1,36 @@
-#include <stdio.h>
-#include <stdlib.h>
-#include <stdint.h>
+#include <cstdio>
+#include <cstdlib>
+#include <cstdint>
+#include <ctime>
+
+#include <algorithm>
 
 #include <tmmintrin.h>
 #include <smmintrin.h>
 
+#define STB_IMAGE_IMPLEMENTATION
+#define STBI_ONLY_JPEG
+#define STBI_ONLY_PNG
+#include "./stb_image.h"
+
+#define STB_IMAGE_WRITE_IMPLEMENTATION
+#include "./stb_image_write.h"
+
 #define SIMD
 
-typedef struct {
+struct Pixel32
+{
     uint8_t r, g, b, a;
-} __attribute__((packed)) Pixel32;
+};
+
+struct Image32
+{
+    Pixel32 *pixels;
+    size_t width;
+    size_t height;
+};
+
+const size_t SIMD_PIXEL_PACK_SIZE = sizeof(__m128i) / sizeof(Pixel32);
 
 Pixel32 mix_pixels(Pixel32 a32, Pixel32 b32)
 {
@@ -27,26 +48,26 @@ Pixel32 mix_pixels(Pixel32 a32, Pixel32 b32)
     return r;
 }
 
-const __m128i _swap_mask =
-    _mm_set_epi8(7,  6,   5,  4,
-                 3,  2,   1,  0,
-                 15, 14, 13, 12,
-                 11, 10,  9,  8
-                 );
-
-const __m128i _aa =
-    _mm_set_epi8( 15,15,15,15,
-                  11,11,11,11,
-                  7,7,7,7,
-                  3,3,3,3 );
-
-const __m128i _mask1 = _mm_set_epi16(-1,0,0,0, -1,0,0,0);
-const __m128i _mask2 = _mm_set_epi16(0,-1,-1,-1, 0,-1,-1,-1);
-const __m128i _v1 = _mm_set1_epi16( 1 );
-
-// https://stackoverflow.com/questions/53643637/simd-for-alpha-blending-how-to-operate-on-every-nth-byte
+// NOTE: Stolen from https://stackoverflow.com/a/53707227
 void mix_pixels_sse(Pixel32 *src, Pixel32 *dst, Pixel32 *c)
 {
+    const __m128i _swap_mask =
+        _mm_set_epi8(7,  6,   5,  4,
+                     3,  2,   1,  0,
+                     15, 14, 13, 12,
+                     11, 10,  9,  8
+            );
+
+    const __m128i _aa =
+        _mm_set_epi8( 15,15,15,15,
+                      11,11,11,11,
+                      7,7,7,7,
+                      3,3,3,3 );
+
+    const __m128i _mask1 = _mm_set_epi16(-1,0,0,0, -1,0,0,0);
+    const __m128i _mask2 = _mm_set_epi16(0,-1,-1,-1, 0,-1,-1,-1);
+    const __m128i _v1 = _mm_set1_epi16( 1 );
+
     __m128i _src = _mm_loadu_si128((__m128i*)src);
     __m128i _src_a = _mm_shuffle_epi8(_src, _aa);
 
@@ -54,10 +75,6 @@ void mix_pixels_sse(Pixel32 *src, Pixel32 *dst, Pixel32 *c)
     __m128i _dst_a = _mm_shuffle_epi8(_dst, _aa);
     __m128i _one_minus_src_a = _mm_subs_epu8(_mm_set1_epi8(-1), _src_a);
 
-    ////////////////////
-    // __m128i _swapped_src = _mm_shuffle_epi8(_src, _swap_mask);
-    // __m128i _extended_swapped_src = _mm_cvtepu8_epi16(_swapped_src);
-    ////////////////////
     __m128i _out = {};
     {
         __m128i _s_a = _mm_cvtepu8_epi16( _src_a );
@@ -107,39 +124,85 @@ void mix_pixels_sse(Pixel32 *src, Pixel32 *dst, Pixel32 *c)
     _mm_storeu_si128( (__m128i_u*) c, _ret );
 }
 
+void slap_image32_onto_image32(Image32 src, Image32 dst,
+                              size_t x0, size_t y0)
+{
+    size_t x1 = std::min(x0 + src.width, dst.width);
+    size_t y1 = std::min(y0 + src.height, dst.height);
+    for (size_t y = y0; y < y1; ++y) {
+        for (size_t x = x0; x < x1; ++x) {
+            dst.pixels[y * dst.width + x] =
+                mix_pixels(
+                    dst.pixels[y * dst.width + x],
+                    src.pixels[(y - y0) * src.width + (x - x0)]);
+        }
+    }
+}
+
+void slap_image32_onto_image32_simd(Image32 src, Image32 dst,
+                               size_t x0, size_t y0)
+{
+    Pixel32 out[SIMD_PIXEL_PACK_SIZE] = {};
+
+    size_t x1 = std::min(x0 + src.width, dst.width);
+    size_t y1 = std::min(y0 + src.height, dst.height);
+    for (size_t y = y0; y < y1; ++y) {
+        for (size_t x = x0; x < x1; x += SIMD_PIXEL_PACK_SIZE) {
+            mix_pixels_sse(
+                &src.pixels[(y - y0) * src.width + (x - x0)],
+                &dst.pixels[y * dst.width + x],
+                &dst.pixels[y * dst.width + x]);
+            // TODO: tail of the row is not taken into account
+        }
+    }
+}
+
+Image32 load_image32(const char *filepath)
+{
+    Image32 result = {};
+    int x, y, n;
+    result.pixels = (Pixel32*) stbi_load(filepath, &x, &y, &n, 4);
+    result.width = x;
+    result.height = y;
+    return result;
+}
+
 int main(int argc, char *argv[])
 {
-    Pixel32 a[] = {
-        {1, 2, 3, 0},
-        {5, 6, 7, 255},
-        {9, 10, 11, 255},
-        {13, 14, 15, 255},
+    static_assert(sizeof(Pixel32) == sizeof(uint32_t),
+                  "Size of Pixel32 is scuffed on your platform lol");
 
-        // {1, 2, 3, 4},
-        // {5, 6, 7, 8},
-        // {9, 10, 11, 12},
-        // {13, 14, 15, 16},
-    };
-    Pixel32 b[] = {
-        {17, 18, 19, 255},
-        {21, 22, 23, 255},
-        {25, 26, 27, 255},
-        {29, 30, 31, 255},
-
-        // {17, 18, 19, 20},
-        // {21, 22, 23, 24},
-        // {25, 26, 27, 28},
-        // {29, 30, 31, 32},
-    };
-    Pixel32 c[4] = {};
-
-#ifndef SIMD
-    for (size_t i = 0; i < 4; ++i) {
-        c[i] = mix_pixels(a[i], b[i]);
-    }
+#ifdef SIMD
+    printf("SIMD ON\n");
 #else
-    mix_pixels_sse(a, b, c);
-#endif  // SIMD
+    printf("SIMD OFF\n");
+#endif
 
+    const char * const DST_FILENAME = "maxresdefault.jpg";
+    Image32 dst = load_image32(DST_FILENAME);
+
+    const char * const SRC_FILENAME = "tsodinFeels.png";
+    Image32 src = load_image32(SRC_FILENAME);
+
+    for (size_t i = 0; i < src.width * src.height; ++i) {
+        src.pixels[i].a = src.pixels[i].a >> 1;
+    }
+
+    size_t pos_x = (dst.width >> 1) - (src.width >> 1);
+    size_t pos_y = (dst.height >> 1) - (src.height >> 1);
+    const size_t N = 100'000;
+    clock_t begin = clock();
+    for (size_t i = 0; i < N; ++i) {
+#ifdef SIMD
+        slap_image32_onto_image32_simd(src, dst, pos_x, pos_y);
+#else
+        slap_image32_onto_image32(src, dst, pos_x, pos_y);
+#endif
+    }
+    printf("    %fs\n", (float)(clock() - begin) / (float) CLOCKS_PER_SEC);
+
+    const char * const OUT_FILENAME = "output.png";
+    int ret = stbi_write_png(OUT_FILENAME, dst.width, dst.height, 4, dst.pixels, dst.width * 4);
+    printf("    ret = %d\n", ret);
     return 0;
 }
