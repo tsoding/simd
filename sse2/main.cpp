@@ -16,8 +16,6 @@
 #define STB_IMAGE_WRITE_IMPLEMENTATION
 #include "./stb_image_write.h"
 
-#define SIMD
-
 struct Pixel32
 {
     uint8_t r, g, b, a;
@@ -48,6 +46,17 @@ Pixel32 mix_pixels(Pixel32 a32, Pixel32 b32)
     return r;
 }
 
+static inline Pixel32 mix_pixels_no_float(Pixel32 src, Pixel32 dst)
+{
+    uint8_t rev_src_a = 255 - src.a;
+    Pixel32 result;
+    result.r = ((uint16_t) src.r * (uint16_t) src.a + (uint16_t) dst.r * rev_src_a) >> 8;
+    result.g = ((uint16_t) src.g * (uint16_t) src.a + (uint16_t) dst.g * rev_src_a) >> 8;
+    result.b = ((uint16_t) src.b * (uint16_t) src.a + (uint16_t) dst.b * rev_src_a) >> 8;
+    result.a = dst.a;
+    return result;
+}
+
 // NOTE: Stolen from https://stackoverflow.com/a/53707227
 void mix_pixels_sse(Pixel32 *src, Pixel32 *dst, Pixel32 *c)
 {
@@ -73,7 +82,8 @@ void mix_pixels_sse(Pixel32 *src, Pixel32 *dst, Pixel32 *c)
 
     __m128i _dst = _mm_loadu_si128((__m128i*)dst);
     __m128i _dst_a = _mm_shuffle_epi8(_dst, _aa);
-    __m128i _one_minus_src_a = _mm_subs_epu8(_mm_set1_epi8(-1), _src_a);
+    __m128i _one_minus_src_a = _mm_subs_epu8(
+        _mm_set1_epi8(-1), _src_a);
 
     __m128i _out = {};
     {
@@ -124,6 +134,21 @@ void mix_pixels_sse(Pixel32 *src, Pixel32 *dst, Pixel32 *c)
     _mm_storeu_si128( (__m128i_u*) c, _ret );
 }
 
+void slap_image32_onto_image32_no_float(Image32 src, Image32 dst,
+                                        size_t x0, size_t y0)
+{
+    size_t x1 = std::min(x0 + src.width, dst.width);
+    size_t y1 = std::min(y0 + src.height, dst.height);
+    for (size_t y = y0; y < y1; ++y) {
+        for (size_t x = x0; x < x1; ++x) {
+            dst.pixels[y * dst.width + x] =
+                mix_pixels_no_float(
+                    src.pixels[(y - y0) * src.width + (x - x0)],
+                    dst.pixels[y * dst.width + x]);
+        }
+    }
+}
+
 void slap_image32_onto_image32(Image32 src, Image32 dst,
                               size_t x0, size_t y0)
 {
@@ -167,16 +192,47 @@ Image32 load_image32(const char *filepath)
     return result;
 }
 
+int main_(int argc, char *argv[])
+{
+    Pixel32 a[] = {
+        {1, 2, 3, 4},
+        {5, 6, 7, 8},
+        {9, 10, 11, 12},
+        {13, 14, 15, 16},
+    };
+
+    Pixel32 b[] = {
+        {17, 18, 19, 20},
+        {21, 22, 23, 24},
+        {25, 26, 27, 28},
+        {29, 30, 31, 32},
+    };
+
+    Pixel32 c[4] = {};
+
+    mix_pixels_sse(a, b, c);
+
+    return 0;
+}
+
+template <typename Slap>
+void benchmark(Slap slap,
+               Image32 src, Image32 dst,
+               size_t pos_x, size_t pos_y,
+               size_t N, const char *message)
+{
+    printf("%s\n", message);
+    clock_t begin = clock();
+    for (size_t i = 0; i < N; ++i) {
+        slap(src, dst, pos_x, pos_y);
+    }
+    printf("    %fs\n", (float)(clock() - begin) / (float) CLOCKS_PER_SEC);
+}
+
 int main(int argc, char *argv[])
 {
     static_assert(sizeof(Pixel32) == sizeof(uint32_t),
                   "Size of Pixel32 is scuffed on your platform lol");
-
-#ifdef SIMD
-    printf("SIMD ON\n");
-#else
-    printf("SIMD OFF\n");
-#endif
 
     const char * const DST_FILENAME = "maxresdefault.jpg";
     Image32 dst = load_image32(DST_FILENAME);
@@ -190,16 +246,11 @@ int main(int argc, char *argv[])
 
     size_t pos_x = (dst.width >> 1) - (src.width >> 1);
     size_t pos_y = (dst.height >> 1) - (src.height >> 1);
+
     const size_t N = 100'000;
-    clock_t begin = clock();
-    for (size_t i = 0; i < N; ++i) {
-#ifdef SIMD
-        slap_image32_onto_image32_simd(src, dst, pos_x, pos_y);
-#else
-        slap_image32_onto_image32(src, dst, pos_x, pos_y);
-#endif
-    }
-    printf("    %fs\n", (float)(clock() - begin) / (float) CLOCKS_PER_SEC);
+    benchmark(slap_image32_onto_image32, src, dst, pos_x, pos_y, N, "Original NO SIMD");
+    benchmark(slap_image32_onto_image32_no_float, src, dst, pos_x, pos_y, N, "Faster NO SIMD");
+    benchmark(slap_image32_onto_image32_simd, src, dst, pos_x, pos_y, N, "SIMD");
 
     const char * const OUT_FILENAME = "output.png";
     int ret = stbi_write_png(OUT_FILENAME, dst.width, dst.height, 4, dst.pixels, dst.width * 4);
