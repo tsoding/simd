@@ -30,8 +30,8 @@ rot13_8b:
 
 _start:
     mov rax, [src]
-    call rot13
-    call rot13
+    call rot13_8b
+    call rot13_8b
 
     mov rax, SYS_EXIT
     mov rdi, 0
